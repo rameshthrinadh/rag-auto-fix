@@ -3,6 +3,7 @@ import tempfile
 import shutil
 import subprocess
 import logging
+from typing import List, Dict, Any
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -15,6 +16,38 @@ def create_sandbox(repo_path: str) -> str:
     sandbox_path = os.path.join(temp_dir, os.path.basename(repo_path))
     shutil.copytree(repo_path, sandbox_path)
     return sandbox_path
+
+def get_patch_blocks(diff_content: str) -> List[Dict[str, Any]]:
+    """
+    Parses the SEARCH/REPLACE blocks into a list of dictionaries for inspection.
+    """
+    blocks = diff_content.split("<<<< ")
+    parsed = []
+    
+    for block in blocks[1:]:
+        try:
+            parts = block.split("\n", 1)
+            if len(parts) < 2: continue
+            
+            file_path_rel = parts[0].strip()
+            rest = parts[1]
+            
+            if "====\n" not in rest or ">>>>" not in rest:
+                continue
+                
+            search_part, replace_raw = rest.split("====\n", 1)
+            search_str = search_part.rstrip("\n")
+            replace_str = replace_raw.split(">>>>")[0].rstrip("\n")
+            
+            parsed.append({
+                "file": file_path_rel,
+                "search": search_str,
+                "replace": replace_str
+            })
+        except Exception:
+            continue
+    return parsed
+
 
 def apply_patch(sandbox_path: str, diff_content: str) -> bool:
     """

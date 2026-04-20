@@ -10,7 +10,12 @@ class DebugRequest(BaseModel):
     extras: Optional[Dict[str, Any]] = None
 
 class DebugResponse(BaseModel):
-    status: str
+    status: str  # "success", "failed", "not_applied"
     fix_diff: str
-    test_results: str
+    test_results: Optional[str] = None
     logs: Optional[str] = None
+    reason: Optional[str] = None
+    suggested_fix: Optional[str] = None
+    explanation: Optional[str] = None
+    confidence: Optional[int] = None
+    risk: Optional[str] = None

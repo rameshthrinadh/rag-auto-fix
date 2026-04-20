@@ -8,8 +8,9 @@ from app.models.schemas import DebugRequest, DebugResponse
 from app.services.retriever import Retriever
 from app.services.context_builder import build_context
 from app.services.llm_agent import generate_fix
-from app.services.patcher import apply_patch
+from app.services.patcher import apply_patch, create_sandbox, get_patch_blocks
 from app.services.test_runner import run_tests
+from app.services.safety import SafetyValidator
 
 def run_debugging_pipeline(request: DebugRequest, repo_path: str) -> DebugResponse:
     logger = logging.getLogger("uvicorn.error")
@@ -88,6 +89,7 @@ def run_debugging_pipeline(request: DebugRequest, repo_path: str) -> DebugRespon
     
     logger.info("Context built successfully. Generating Fix via LLM Agent...")
     logs = []
+    safety = SafetyValidator(repo_path)
     
     for attempt in range(settings.MAX_RETRIES):
         model_to_use = settings.PRIMARY_LLM_MODEL if attempt == 0 else settings.FALLBACK_LLM_MODEL
@@ -95,50 +97,124 @@ def run_debugging_pipeline(request: DebugRequest, repo_path: str) -> DebugRespon
         logs.append(attempt_msg)
         logger.info(attempt_msg)
         
-        diff = generate_fix(context, model_to_use)
+        # LLM returns a structured dict now
+        llm_response = generate_fix(context, model_to_use)
         
-        if not diff:
-            fail_msg = "No diff generated. Halting."
-            logs.append(fail_msg)
-            logger.error(fail_msg)
-            break
-            
-        logs.append("Generated diff fix.")
-        logger.info(f"Successfully Generated Patch Length: {len(diff)} chars")
-        logger.info(f"Diff Payload:\n{diff}")
+        confidence = llm_response.get("confidence", 0)
+        risk = llm_response.get("risk", "HIGH")
+        fix_payload = llm_response.get("fix", "")
+        explanation = llm_response.get("explanation", "")
+        root_cause = llm_response.get("root_cause", "")
+
+        logger.info(f"Fix generated: {fix_payload} \n Explanation: {explanation} \n Root Cause: {root_cause}")
         
-        logger.info("Applying diff directly to source code...")
-        patched = apply_patch(repo_path, diff)
-        
-        if not patched:
-            logs.append("Failed to apply patch explicitly to repository.")
-            logger.warning("Patch rejection detected. Natively reverting...")
-            continue
-            
-        logs.append("Patch applied directly to source code. Running tests...")
-        logger.info("Host patched successfully. Bootstrapping pytest framework...")
-        tests_passed, test_output = run_tests(repo_path)
-        
-        if tests_passed:
-            logs.append("Tests passed!")
-            logger.info("✅ Tests executed successfully! Pipeline Complete!")
+        # 1. Decision Gate: Confidence & Risk
+        if confidence < 70 or risk == "HIGH":
+            msg = f"Fix rejected by Decision Engine: Confidence {confidence}%, Risk {risk}."
+            logger.warning(msg)
             return DebugResponse(
-                status="success",
-                fix_diff=diff,
-                test_results=test_output,
+                status="not_applied",
+                fix_diff=fix_payload,
+                reason=msg,
+                suggested_fix=fix_payload,
+                explanation=explanation,
+                confidence=confidence,
+                risk=risk,
                 logs="\n".join(logs)
             )
-        else:
-            logs.append("Tests failed on this attempt.")
-            logger.warning(f"❌ Tests Failed! Re-formatting context block for LLM escalation...")
-            logger.debug(f"Test Execution Logs: {test_output}")
-            context += f"\n\n### Attempt {attempt+1} failed with tests: ###\n{test_output}\nGenerate a better fix."
+
+        # 2. Safety Heuristics Check
+        patch_blocks = get_patch_blocks(fix_payload)
+        is_safe, safety_reason = safety.validate_patch(patch_blocks, {}) # Passing empty dict for now, expanded later
+        if not is_safe:
+            logger.warning(f"Fix rejected by Safety Heuristics: {safety_reason}")
+            return DebugResponse(
+                status="not_applied",
+                fix_diff=fix_payload,
+                reason=safety_reason,
+                suggested_fix=fix_payload,
+                explanation=explanation,
+                confidence=confidence,
+                risk=risk,
+                logs="\n".join(logs)
+            )
+
+        # 3. Sandbox Logic: Never modify original code before full validation
+        logger.info("Creating local sandbox for pre-commit validation...")
+        sandbox_path = create_sandbox(repo_path)
+        
+        try:
+            # 4. Apply to Sandbox
+            patched = apply_patch(sandbox_path, fix_payload)
+            if not patched:
+                logger.warning("Failed to apply patch to sandbox. Retrying...")
+                shutil.rmtree(os.path.dirname(sandbox_path))
+                continue
+                
+            # 5. Syntax Validation
+            for block in patch_blocks:
+                full_file_path = os.path.join(sandbox_path, block["file"])
+                if os.path.exists(full_file_path):
+                    with open(full_file_path, 'r') as f:
+                        valid, syntax_err = safety.validate_syntax(f.read())
+                        if not valid:
+                            logger.error(f"Syntax error detected after patching {block['file']}: {syntax_err}")
+                            return DebugResponse(
+                                status="not_applied",
+                                fix_diff=fix_payload,
+                                reason=f"Syntax Error after patch: {syntax_err}",
+                                suggested_fix=fix_payload,
+                                explanation=explanation,
+                                confidence=confidence,
+                                risk=risk,
+                                logs="\n".join(logs)
+                            )
+
+            # 6. Post-Patch Test Validation
+            logger.info("Sandbox patched and syntax verified. Running pytest...")
             
-    logger.error("Pipeline reached maximum fallback retries. Halting.")
+            # Identify the primary file being patched for scoped testing
+            primary_patch_file = patch_blocks[0]["file"] if patch_blocks else None
+            
+            tests_passed, test_output = run_tests(
+                sandbox_path, 
+                target_file=primary_patch_file, 
+                original_error=request.error
+            )
+            
+            if tests_passed:
+                # 7. COMMIT: Move changes back to repo_path only on total success
+                logger.info("✅ All safety and test gates passed. Committing changes to original repository.")
+                # We copy the modified files back to the original repo_path
+                for block in patch_blocks:
+                    src = os.path.join(sandbox_path, block["file"])
+                    dst = os.path.join(repo_path, block["file"])
+                    os.makedirs(os.path.dirname(dst), exist_ok=True)
+                    shutil.copy2(src, dst)
+                
+                logs.append("All gates passed. Fix applied natively.")
+                return DebugResponse(
+                    status="success",
+                    fix_diff=fix_payload,
+                    test_results=test_output,
+                    explanation=explanation,
+                    confidence=confidence,
+                    risk=risk,
+                    logs="\n".join(logs)
+                )
+            else:
+                logger.warning(f"❌ Tests failed in sandbox. Root Cause: {root_cause}")
+                logs.append(f"Test failure in sandbox on Attempt {attempt+1}")
+                context += f"\n\n### Attempt {attempt+1} failed with tests: ###\n{test_output}\nFix the logic."
+                
+        finally:
+            # Always cleanup sandbox
+            if os.path.exists(os.path.dirname(sandbox_path)):
+                shutil.rmtree(os.path.dirname(sandbox_path))
             
     return DebugResponse(
         status="failed",
         fix_diff="",
-        test_results="Max retries reached without passing tests.",
+        test_results="Safety/Test boundaries could not be satisfied within retry limit.",
         logs="\n".join(logs)
     )

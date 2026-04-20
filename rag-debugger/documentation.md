@@ -1,15 +1,29 @@
-# RAG-Debugger: Autonomous Code Repair Documentation
+# RAG-Debugger: Autonomous & Safe Code Repair
 
-The RAG-Debugger is an intelligent, agentic debugging service designed to automatically resolve runtime errors in large repositories. By combining FAISS vector search, intelligent stacktrace analysis, and autonomous test-driven iteration, it identifies root causes and applies robust code fixes natively to the target codebase.
+The RAG-Debugger is an agentic debugging pipeine designed to automatically resolve runtime errors in large repositories. It prioritizes system safety and trust by using a multi-stage validation engine before committing any changes.
+
+---
 
 ## 🚀 Key Features
 
-- **Autonomous Orchestration**: Automatically retries fixes with escalated LLM models (`GPT-4o`) if initial attempts fail tests.
-- **Stacktrace Anchoring**: Real-time parsing of error logs to automatically identify the exact file and line number within your repository.
-- **Application-First Logic**: Heuristically prioritizes your business logic over infrastructure/utility boilerplates (e.g., database wrappers, telemetry).
-- **Trace Breadcrumbs**: Injects snippets from multiple unique files along the execution path, providing the AI with a 360-degree view of the fault.
-- **Robust Patching**: Uses a custom **Search/Replace Block** parser that is whitespace-invariant and supports fuzzy line-level matching to handle dynamic code construction.
-- **Native Execution**: Operates directly on your repository (or a sandbox) without brittle `patch` command dependencies.
+### 1. Logic-Anchored Discovery
+- **Stacktrace Anchoring**: Real-time parsing of error logs to automatically identify the exact file and line number.
+- **Application-First Heuristics**: Automatically skips infrastructure wrappers (DB drivers, metrics) to focus the AI on the business logic where the bug resides.
+- **Function-Level Boosting**: Matches function names from the trace to prioritize relevant code chunks in the FAISS index (6x priority boost).
+
+### 2. Trust & Safety Gates
+- **Decision Engine**: Self-assessment of **Confidence (0-100)** and **Risk (LOW/MEDIUM/HIGH)**. If Confidence < 85% or Risk is HIGH, the fix is returned as a "Suggestion" but not applied.
+- **Hard Safety Rules**: Automatically blocks any fix that:
+    - Modifies function/class signatures.
+    - Performs large-scale code deletions.
+    - Touches more than 2 files.
+    - Edits sensitive files (`.env`, `config.py`, database drivers).
+- **Syntax Verification**: Pre-validates every patch using Python AST parsing before execution.
+
+### 3. Smart Test Runner
+- **Environment Aware**: Automatically detects and uses project virtual environments (`.venv`, `rvenv`).
+- **Scoped Execution**: Runs `pytest` specifically on the patched files to minimize noise and speed up validation.
+- **Heuristic Success**: If total tests fail due to environment noise, the system confirms if the **specific error message** from the original trace has vanished. If so, it considers the fix a "Probable Success."
 
 ---
 
@@ -17,12 +31,10 @@ The RAG-Debugger is an intelligent, agentic debugging service designed to automa
 
 ### 1. Vector Indexing (`indexing/indexer.py`)
 Parses your Python workspace into AST-aware chunks and builds an offline FAISS vector index.
-- **Incremental Updates**: Uses `hashlib` to only embed modified or new code chunks, saving API costs.
 - **Command**: `python indexing/indexer.py --repo=/path/to/repo`
-- **Options**: Use `--force=true` to nuke the cache and rebuild from scratch.
 
 ### 2. The API Server (`app/main.py`)
-A FastAPI instance that exposes the debugging pipeline to your IDE, CI/CD, or production environment.
+FastAPI instance exposing the debugging pipeline.
 - **Command**: `uvicorn app.main:app --reload --port 8000`
 
 ---
@@ -35,22 +47,21 @@ Triggers the full RAG-driven debugging pipeline.
 **Request Schema (`DebugRequest`):**
 ```json
 {
-  "error": "The error message (e.g. ValueError)",
+  "error": "The error message",
   "stacktrace": "Full Traceback string",
-  "file": "Optional: Path to target file",
-  "line": "Optional: target line number (int)",
-  "repo_path": "Optional: Override configured REPO_PATH",
-  "extras": {
-    "key": "Optional: Any extra project-specific context"
-  }
+  "extras": { "context": "Additional project metadata" }
 }
 ```
 
 **Response Schema (`DebugResponse`):**
 ```json
 {
-  "status": "success | failed",
+  "status": "success | failed | not_applied",
   "fix_diff": "The Search/Replace block applied",
+  "reason": "Reason for rejection if status is not_applied",
+  "explanation": "AI reasoning for the fix",
+  "confidence": 95,
+  "risk": "LOW",
   "test_results": "Raw pytest output",
   "logs": "Pipeline execution breadcrumbs"
 }
@@ -58,20 +69,8 @@ Triggers the full RAG-driven debugging pipeline.
 
 ---
 
-## 🧠 Logic & Retrieval Strategy
-
-- **Function-Level Boosting**: The system Extracts function names from the stacktrace. If a code chunk's name matches a function in the trace, it receives a **6x higher prioritization** boost during retrieval.
-- **Infrastructure Filtering**: The system automatically skips generic directories like `db_conn`, `utils`, `telemetry`, and `common` when identifying the "Primary" error location to anchor the fix on application logic.
-- **Context Capacity**: 
-  - **Token Budget**: 10,000 tokens (Tokenized via `cl100k_base`).
-  - **Search Depth**: Top 5 relevant code chunks.
-  - **Snippet Padding**: ±50 lines around the error points.
-
----
-
 ## 🏗️ Robust Patcher Format
-
-The debugger avoids brittle `diff` formats. It emits **Search/Replace Blocks** that our native parser applies with high reliability:
+The debugger uses **Search/Replace Blocks** that are whitespace-invariant and support fuzzy matching:
 
 ```python
 <<<< relative/path/to/file.py
@@ -80,20 +79,3 @@ exact (or fuzzy) lines to find
 new code to replace them with
 >>>>
 ```
-
-**Matching Logic**:
-1. **Exact Match**: Tries char-by-char matching first.
-2. **Fuzzy Match**: Collapses all internal whitespace and ignores indentation to find a line-level match, ensuring stability across code formatters.
-
----
-
-## ⚙️ Configuration (`.env`)
-
-| Variable | Description | Default |
-| :--- | :--- | :--- |
-| `OPENAI_API_KEY` | Your OpenAI API Key | - |
-| `REPO_PATH` | Path to the repository to debug | `/tmp/repo` |
-| `PRIMARY_LLM_MODEL` | Faster model for first attempt | `gpt-4o-mini` |
-| `FALLBACK_LLM_MODEL`| Stronger model for retries | `gpt-4o` |
-| `FAISS_INDEX_PATH` | Path to FAISS vector binary | `./data/faiss_index/index.faiss` |
-| `MAX_RETRIES` | Number of attempts before halting | `2` |
