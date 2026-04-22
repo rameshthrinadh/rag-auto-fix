@@ -12,6 +12,21 @@ from app.services.patcher import apply_patch, create_sandbox, get_patch_blocks
 from app.services.test_runner import run_tests
 from app.services.safety import SafetyValidator
 
+def log_unfixable(request: DebugRequest, reason: str, fix_payload: str, explanation: str):
+    try:
+        with open("unfixable_errors.log", "a", encoding="utf-8") as f:
+            f.write(f"==== UNFIXABLE ERROR ====\n")
+            f.write(f"Error: {request.error}\n")
+            f.write(f"File: {request.file}:{request.line}\n")
+            f.write(f"Reason: {reason}\n")
+            f.write(f"Explanation: {explanation}\n")
+            f.write(f"Suggested Payload:\n{fix_payload}\n")
+            f.write(f"==========================\n\n")
+    except Exception as e:
+        logger = logging.getLogger("uvicorn.error")
+        logger.error(f"Failed to log unfixable error: {e}")
+
+
 def run_debugging_pipeline(request: DebugRequest, repo_path: str) -> DebugResponse:
     logger = logging.getLogger("uvicorn.error")
     logger.info(f"==== Starting RAG Pipeline Execution ====")
@@ -112,6 +127,7 @@ def run_debugging_pipeline(request: DebugRequest, repo_path: str) -> DebugRespon
         if confidence < 70 or risk == "HIGH":
             msg = f"Fix rejected by Decision Engine: Confidence {confidence}%, Risk {risk}."
             logger.warning(msg)
+            log_unfixable(request, msg, fix_payload, explanation)
             return DebugResponse(
                 status="not_applied",
                 fix_diff=fix_payload,
@@ -128,6 +144,7 @@ def run_debugging_pipeline(request: DebugRequest, repo_path: str) -> DebugRespon
         is_safe, safety_reason = safety.validate_patch(patch_blocks, {}) # Passing empty dict for now, expanded later
         if not is_safe:
             logger.warning(f"Fix rejected by Safety Heuristics: {safety_reason}")
+            log_unfixable(request, f"Safety Heuristics: {safety_reason}", fix_payload, explanation)
             return DebugResponse(
                 status="not_applied",
                 fix_diff=fix_payload,
@@ -159,6 +176,7 @@ def run_debugging_pipeline(request: DebugRequest, repo_path: str) -> DebugRespon
                         valid, syntax_err = safety.validate_syntax(f.read())
                         if not valid:
                             logger.error(f"Syntax error detected after patching {block['file']}: {syntax_err}")
+                            log_unfixable(request, f"Syntax Error after patch: {syntax_err}", fix_payload, explanation)
                             return DebugResponse(
                                 status="not_applied",
                                 fix_diff=fix_payload,
@@ -212,6 +230,7 @@ def run_debugging_pipeline(request: DebugRequest, repo_path: str) -> DebugRespon
             if os.path.exists(os.path.dirname(sandbox_path)):
                 shutil.rmtree(os.path.dirname(sandbox_path))
             
+    log_unfixable(request, "Exhausted retries without passing tests.", "", "")
     return DebugResponse(
         status="failed",
         fix_diff="",
