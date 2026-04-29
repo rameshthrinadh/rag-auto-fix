@@ -221,15 +221,39 @@ def run_debugging_pipeline(request: DebugRequest, repo_path: str) -> DebugRespon
             
             if tests_passed:
                 # 7. COMMIT: Move changes back to repo_path only on total success
-                logger.info("✅ All safety and test gates passed. Committing changes to original repository.")
-                # We copy the modified files back to the original repo_path
+                logger.info("✅ All safety and test gates passed. Creating PR in original repository.")
+                
+                import subprocess
+                import uuid
+                branch_name = f"fix/auto-rag-{uuid.uuid4().hex[:8]}"
+                
+                # Checkout to production
+                subprocess.run(["git", "checkout", "production"], cwd=repo_path, check=False, capture_output=True)
+                subprocess.run(["git", "pull", "origin", "production"], cwd=repo_path, check=False, capture_output=True)
+                
+                # Checkout new branch
+                subprocess.run(["git", "checkout", "-b", branch_name], cwd=repo_path, check=False, capture_output=True)
+                
+                # Patch it
                 for block in patch_blocks:
                     src = os.path.join(sandbox_path, block["file"])
                     dst = os.path.join(repo_path, block["file"])
                     os.makedirs(os.path.dirname(dst), exist_ok=True)
                     shutil.copy2(src, dst)
+                    
+                # Raise PR (add, commit, push, gh pr)
+                subprocess.run(["git", "add", "."], cwd=repo_path, check=False)
+                commit_msg = f"fix: Auto-RAG Debugger Patch\n\nRoot Cause: {root_cause}"
+                subprocess.run(["git", "commit", "-m", commit_msg], cwd=repo_path, check=False)
+                subprocess.run(["git", "push", "-u", "origin", branch_name], cwd=repo_path, check=False)
                 
-                logs.append("All gates passed. Fix applied natively.")
+                try:
+                    subprocess.run(["gh", "pr", "create", "--title", f"Auto-Fix: Debugger Patch", "--body", commit_msg], cwd=repo_path, check=False)
+                    pr_msg = f"PR raised successfully on branch {branch_name}"
+                except FileNotFoundError:
+                    pr_msg = f"Branch {branch_name} pushed. Install GitHub CLI (gh) to auto-raise PRs."
+                
+                logs.append(f"All gates passed. {pr_msg}")
                 return DebugResponse(
                     status="success",
                     fix_diff=fix_payload,
