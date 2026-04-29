@@ -1,3 +1,4 @@
 rvenv/
 .env
 data/
+unfixable_errors.log

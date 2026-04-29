@@ -10,7 +10,7 @@ from app.core.config import settings
 from app.core.constants import TOP_K_RESULTS, CONTEXT_LINE_PADDING
 from indexing.indexer import get_embeddings_batch # using the batch function for single embed too
 
-INFRASTRUCTURE_KEYWORDS = {"db_conn", "telemetry", "utils", "common", "middleware", "__init__", "database", "logger", "metrics"}
+INFRASTRUCTURE_KEYWORDS = {"db_conn", "telemetry", "middleware", "__init__", "logger", "metrics", "env", "venv", "site-packages", "cursors.py", "connections.py", "pymysql"}
 
 class Retriever:
     def __init__(self):
@@ -58,6 +58,10 @@ class Retriever:
                     pass
         return results
 
+    def is_infrastructure(self, file_path: str) -> bool:
+        """Helper to check if a file path belongs to infrastructure."""
+        return any(kw in file_path.lower() for kw in INFRASTRUCTURE_KEYWORDS)
+
     def extract_primary_location(self, stacktrace: str, repo_path: str) -> Tuple[Optional[str], Optional[int]]:
         """
         Parses the stacktrace to find the most relevant (innermost) file/line 
@@ -103,7 +107,7 @@ class Retriever:
     def search(self, error: str, stacktrace: str, file_name: Optional[str] = None, top_k: int = TOP_K_RESULTS) -> List[Dict[str, Any]]:
         """
         Embeds the query and fetches the top matched chunks. 
-        Then reranks based on exact keyword path hits.
+        Then expands context using Graph DB and reranks based on exact keyword hits.
         """
         if not self.index or self.index.ntotal == 0:
             return []
@@ -119,17 +123,50 @@ class Retriever:
         
         distances, indices = self.index.search(query_np, search_k)
         
-        results = []
+        candidates = []
         for idx in indices[0]:
             if idx != -1:
                 # Metadata is a list, safely access by index
                 if isinstance(self.metadata, list):
                     if 0 <= idx < len(self.metadata):
-                        results.append(self.metadata[idx])
+                        candidates.append(self.metadata[idx])
                 elif isinstance(self.metadata, dict):
                     str_idx = str(idx)
                     if str_idx in self.metadata:
-                        results.append(self.metadata[str_idx])
+                        candidates.append(self.metadata[str_idx])
+                        
+        # --- Context Expansion via Graph DB ---
+        from indexing.graph_store import load_graph
+        graph = load_graph()
+        
+        expanded_results = {}
+        for c in candidates:
+            node_id = c.get('node_id')
+            if not node_id:
+                node_id = f"{c.get('repo')}/{c.get('file')}/{c.get('name')}"
+                
+            expanded_results[node_id] = c
+            
+            # Graph Traversal (Depth 1 expansion: CALLED, BELONGS_TO)
+            if graph.has_node(node_id):
+                # Outgoing edges (what this function calls)
+                for neighbor in graph.successors(node_id):
+                    if neighbor not in expanded_results:
+                        for m in (self.metadata if isinstance(self.metadata, list) else self.metadata.values()):
+                            if m.get('node_id') == neighbor or f"{m.get('repo')}/{m.get('file')}/{m.get('name')}" == neighbor:
+                                expanded_results[neighbor] = m
+                                break
+                
+                # Incoming edges (parents/callers)
+                for neighbor in graph.predecessors(node_id):
+                    if neighbor not in expanded_results:
+                        for m in (self.metadata if isinstance(self.metadata, list) else self.metadata.values()):
+                            if m.get('node_id') == neighbor or f"{m.get('repo')}/{m.get('file')}/{m.get('name')}" == neighbor:
+                                expanded_results[neighbor] = m
+                                break
+
+        results = list(expanded_results.values())
+        # ------------------------------------
                     
         # Filter and rank using intelligent keywords (file basenames + function names)
         keywords = self.extract_keywords_from_trace(stacktrace, file_name)
@@ -164,15 +201,57 @@ class Retriever:
     def get_file_snippet(self, file_path: str, line_number: int, padding: int = CONTEXT_LINE_PADDING) -> str:
         """
         Fetches the exact lines around the error from the file.
+        Attempts to find the enclosing AST function/class to provide full logical context.
+        Falls back to +/- padding if parsing fails or for non-Python files.
         """
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
-                lines = f.readlines()
-                
-            start = max(0, line_number - padding - 1)
+                src = f.read()
+                lines = src.splitlines()
+
+            # Try AST parsing for .py files
+            if file_path.endswith('.py'):
+                import ast
+                try:
+                    tree = ast.parse(src)
+                    
+                    class NodeFinder(ast.NodeVisitor):
+                        def __init__(self, target_line):
+                            self.target_line = target_line
+                            self.best_match = None
+                            
+                        def generic_visit(self, node):
+                            if hasattr(node, 'lineno'):
+                                start = node.lineno
+                                end = getattr(node, 'end_lineno', start)
+                                if start <= self.target_line <= end:
+                                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                                        self.best_match = node
+                            super().generic_visit(node)
+                            
+                    finder = NodeFinder(line_number)
+                    finder.visit(tree)
+                    
+                    if finder.best_match:
+                        node = finder.best_match
+                        start = max(0, node.lineno - 1)
+                        end = min(len(lines), getattr(node, 'end_lineno', node.lineno))
+                        
+                        # Guard rail for monstrous functions (> 400 lines)
+                        if (end - start) <= 400:
+                            return "\n".join(lines[start:end]) + "\n"
+                        else:
+                            logger = logging.getLogger("uvicorn.error")
+                            logger.debug(f"AST node for {file_path} is too large ({end-start} lines), falling back to padding.")
+                except Exception as ast_err:
+                    logger = logging.getLogger("uvicorn.error")
+                    logger.debug(f"AST extraction failed for {file_path}, falling back to padding. Error: {ast_err}")
+
+            # Fallback to naive padding (biased upward to catch variable definitions like SQL queries)
+            start = max(0, line_number - (padding * 5) - 1)
             end = min(len(lines), line_number + padding)
             
             snippet_lines = lines[start:end]
-            return "".join(snippet_lines)
+            return "\n".join(snippet_lines) + "\n"
         except Exception as e:
             return f"Could not read snippet from {file_path}: {e}"

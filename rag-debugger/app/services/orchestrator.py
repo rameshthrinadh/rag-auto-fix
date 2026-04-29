@@ -12,15 +12,20 @@ from app.services.patcher import apply_patch, create_sandbox, get_patch_blocks
 from app.services.test_runner import run_tests
 from app.services.safety import SafetyValidator
 
+import json
+
 def log_unfixable(request: DebugRequest, reason: str, fix_payload: str, explanation: str):
     try:
-        with open("unfixable_errors.log", "a", encoding="utf-8") as f:
+        log_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "unfixable_errors.log")
+        with open(log_path, "a", encoding="utf-8") as f:
             f.write(f"==== UNFIXABLE ERROR ====\n")
             f.write(f"Error: {request.error}\n")
             f.write(f"File: {request.file}:{request.line}\n")
             f.write(f"Reason: {reason}\n")
             f.write(f"Explanation: {explanation}\n")
-            f.write(f"Suggested Payload:\n{fix_payload}\n")
+            f.write(f"--- Original Request Payload ---\n")
+            f.write(json.dumps(request.dict(), indent=2) + "\n")
+            f.write(f"--- Suggested Patch Payload ---\n{fix_payload}\n")
             f.write(f"==========================\n\n")
     except Exception as e:
         logger = logging.getLogger("uvicorn.error")
@@ -63,6 +68,10 @@ def run_debugging_pipeline(request: DebugRequest, repo_path: str) -> DebugRespon
         rel_path = loc['file']
         line_num = loc['line']
         
+        # Skip infrastructure snippets to keep LLM focused on business logic
+        if retriever.is_infrastructure(rel_path):
+            continue
+            
         if rel_path not in unique_files_in_trace:
             full_path = os.path.join(repo_path, rel_path)
             snippet = retriever.get_file_snippet(full_path, line_num)
@@ -120,8 +129,17 @@ def run_debugging_pipeline(request: DebugRequest, repo_path: str) -> DebugRespon
         fix_payload = llm_response.get("fix", "")
         explanation = llm_response.get("explanation", "")
         root_cause = llm_response.get("root_cause", "")
+        trace = llm_response.get("trace", "")
+        
+        debug_info = None
+        if getattr(request, "debug_mode", False):
+            debug_info = {
+                "retrieved_nodes": [f"{c.get('repo')}/{c.get('file')}/{c.get('name')}" for c in retrieved_chunks],
+                "reasoning_trace": trace,
+                "dependency_graph_depth": 1 # Hardcoded for now based on retriever
+            }
 
-        logger.info(f"Fix generated: {fix_payload} \n Explanation: {explanation} \n Root Cause: {root_cause}")
+        logger.info(f"Fix generated: {fix_payload} \n Explanation: {explanation} \n Root Cause: {root_cause} \n Trace: {trace}")
         
         # 1. Decision Gate: Confidence & Risk
         if confidence < 70 or risk == "HIGH":
@@ -140,7 +158,7 @@ def run_debugging_pipeline(request: DebugRequest, repo_path: str) -> DebugRespon
             )
 
         # 2. Safety Heuristics Check
-        patch_blocks = get_patch_blocks(fix_payload)
+        patch_blocks = get_patch_blocks(fix_payload, repo_path)
         is_safe, safety_reason = safety.validate_patch(patch_blocks, {}) # Passing empty dict for now, expanded later
         if not is_safe:
             logger.warning(f"Fix rejected by Safety Heuristics: {safety_reason}")
@@ -185,7 +203,8 @@ def run_debugging_pipeline(request: DebugRequest, repo_path: str) -> DebugRespon
                                 explanation=explanation,
                                 confidence=confidence,
                                 risk=risk,
-                                logs="\n".join(logs)
+                                logs="\n".join(logs),
+                                debug_info=debug_info
                             )
 
             # 6. Post-Patch Test Validation
@@ -218,7 +237,8 @@ def run_debugging_pipeline(request: DebugRequest, repo_path: str) -> DebugRespon
                     explanation=explanation,
                     confidence=confidence,
                     risk=risk,
-                    logs="\n".join(logs)
+                    logs="\n".join(logs),
+                    debug_info=debug_info
                 )
             else:
                 logger.warning(f"❌ Tests failed in sandbox. Root Cause: {root_cause}")

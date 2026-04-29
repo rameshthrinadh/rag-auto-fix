@@ -17,7 +17,7 @@ def create_sandbox(repo_path: str) -> str:
     shutil.copytree(repo_path, sandbox_path)
     return sandbox_path
 
-def get_patch_blocks(diff_content: str) -> List[Dict[str, Any]]:
+def get_patch_blocks(diff_content: str, repo_path: str = None) -> List[Dict[str, Any]]:
     """
     Parses the SEARCH/REPLACE blocks into a list of dictionaries for inspection.
     """
@@ -30,6 +30,15 @@ def get_patch_blocks(diff_content: str) -> List[Dict[str, Any]]:
             if len(parts) < 2: continue
             
             file_path_rel = parts[0].strip()
+            
+            if repo_path:
+                repo_basename = os.path.basename(repo_path)
+                if os.path.isabs(file_path_rel):
+                    if repo_basename in file_path_rel:
+                        file_path_rel = file_path_rel.split(repo_basename + "/")[-1]
+                if f"../{repo_basename}/" in file_path_rel:
+                    file_path_rel = file_path_rel.split(f"{repo_basename}/")[-1]
+
             rest = parts[1]
             
             if "====\n" not in rest or ">>>>" not in rest:
@@ -70,12 +79,16 @@ def apply_patch(sandbox_path: str, diff_content: str) -> bool:
             file_path_rel = parts[0].strip()
             
             # Dynamically trap absolute path hallucinations
+            repo_basename = os.path.basename(sandbox_path)
             if file_path_rel.startswith(sandbox_path):
                 file_path_rel = file_path_rel[len(sandbox_path):].lstrip("/")
             elif os.path.isabs(file_path_rel):
-                repo_basename = os.path.basename(sandbox_path)
                 if repo_basename in file_path_rel:
                     file_path_rel = file_path_rel.split(repo_basename + "/")[-1]
+            
+            # Trap relative path hallucinations that escape and re-enter the repo
+            if f"../{repo_basename}/" in file_path_rel:
+                file_path_rel = file_path_rel.split(f"{repo_basename}/")[-1]
                     
             rest = parts[1]
             

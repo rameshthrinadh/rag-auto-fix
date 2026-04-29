@@ -1,120 +1,146 @@
-import ast
-import tiktoken
-from typing import List, Dict, Any
-from app.core.constants import MAX_CHUNK_TOKENS, TARGET_CHUNK_TOKENS
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
 
-# Initialize tiktoken globally for efficiency
+import tiktoken
+import tree_sitter_languages
+from typing import List, Dict, Any
+
 tokenizer = tiktoken.get_encoding("cl100k_base")
 
 def count_tokens(text: str) -> int:
     return len(tokenizer.encode(text))
 
-def sliding_window_chunk(text: str, file_path: str, name: str, node_type: str, imports: List[str], start_line: int) -> List[Dict[str, Any]]:
-    """
-    Splits text blocks that exceed MAX_CHUNK_TOKENS using a targeted sliding window approach.
-    """
-    lines = text.splitlines()
-    chunks = []
-    current_chunk_lines = []
-    current_tokens = 0
-    current_start_line = start_line
-    
-    for i, line in enumerate(lines):
-        line_tokens = count_tokens(line + "\n")
-        
-        if current_tokens + line_tokens > TARGET_CHUNK_TOKENS and current_chunk_lines:
-            # finalize chunk
-            block_code = "\n".join(current_chunk_lines)
-            chunks.append({
-                "name": f"{name}_part_{len(chunks)+1}",
-                "type": node_type,
-                "code": block_code,
-                "file": file_path,
-                "imports": imports,
-                "start_line": current_start_line,
-                "end_line": current_start_line + len(current_chunk_lines) - 1,
-                "tokens": current_tokens
-            })
-            
-            # Slide window (keep some overlap, e.g. last 5 lines if possible)
-            overlap_lines = current_chunk_lines[-5:] if len(current_chunk_lines) > 5 else []
-            current_chunk_lines = overlap_lines + [line]
-            current_tokens = count_tokens("\n".join(current_chunk_lines) + "\n")
-            current_start_line = current_start_line + len(current_chunk_lines) - len(overlap_lines)
-        else:
-            current_chunk_lines.append(line)
-            current_tokens += line_tokens
-            
-    if current_chunk_lines:
-        block_code = "\n".join(current_chunk_lines)
-        chunks.append({
-            "name": f"{name}_part_{len(chunks)+1}",
-            "type": node_type,
-            "code": block_code,
-            "file": file_path,
-            "imports": imports,
-            "start_line": current_start_line,
-            "end_line": current_start_line + len(current_chunk_lines) - 1,
-            "tokens": current_tokens
-        })
-        
-    return chunks
+def node_text(node, source_code: bytes) -> str:
+    return source_code[node.start_byte:node.end_byte].decode('utf-8')
 
-def process_node(node_code: str, file_path: str, name: str, node_type: str, imports: List[str], start_line: int, end_line: int) -> List[Dict[str, Any]]:
-    tokens = count_tokens(node_code)
+def extract_docstring(node, source_code: bytes) -> str:
+    """Extracts the docstring from a function or class node."""
+    if node.type in ['function_definition', 'class_definition']:
+        body = node.child_by_field_name('body')
+        if body and body.children:
+            first_stmt = body.children[0]
+            if first_stmt.type == 'expression_statement':
+                expr = first_stmt.children[0]
+                if expr.type == 'string':
+                    return node_text(expr, source_code).strip('\'"')
+    return ""
+
+def extract_calls(node, source_code: bytes) -> List[str]:
+    """Recursively finds all function calls within a node's body."""
+    calls = []
+    def walk(n):
+        if n.type == 'call':
+            func_node = n.child_by_field_name('function')
+            if func_node:
+                calls.append(node_text(func_node, source_code))
+        for child in n.children:
+            walk(child)
     
-    if tokens > MAX_CHUNK_TOKENS:
-        return sliding_window_chunk(node_code, file_path, name, node_type, imports, start_line)
-    
-    return [{
-        "name": name,
-        "type": node_type,
-        "code": node_code,
-        "file": file_path,
-        "imports": imports,
-        "start_line": start_line,
-        "end_line": end_line,
-        "tokens": tokens
-    }]
+    # Exclude the node itself to avoid catching the definition as a call
+    body = node.child_by_field_name('body')
+    if body:
+        walk(body)
+        
+    seen = set()
+    return [c for c in calls if not (c in seen or seen.add(c))]
+
+def extract_imports(tree, source_code: bytes) -> List[str]:
+    """Finds all imports in the file to resolve external calls later."""
+    imports = []
+    def walk(n):
+        if n.type == 'import_statement':
+            for child in n.children:
+                if child.type == 'dotted_name':
+                    imports.append(node_text(child, source_code))
+        elif n.type == 'import_from_statement':
+            module_name_node = n.child_by_field_name('module_name')
+            if module_name_node:
+                imports.append(node_text(module_name_node, source_code))
+        for child in n.children:
+            walk(child)
+    walk(tree.root_node)
+    return list(set(imports))
 
 def get_ast_chunks(file_content: str, file_path: str) -> List[Dict[str, Any]]:
     """
-    Parses a python file content into token-safe chunks representing classes and functions.
+    Parses a python file content into structured entities using tree-sitter.
+    Extracts classes, functions, and methods with their relationships.
     """
-    chunks = []
+    # Simple heuristic for repo name, normally passed in from higher level
+    parts = file_path.split('/')
+    repo = parts[-3] if len(parts) >= 3 else "unknown_repo"
     
     try:
-        tree = ast.parse(file_content)
-    except SyntaxError:
-        # Fallback if there's a syntax error in the python file
-        return process_node(file_content, file_path, "module_scope", "module", [], 1, len(file_content.splitlines()))
+        parser = tree_sitter_languages.get_parser("python")
+    except Exception as e:
+        print(f"Error loading tree-sitter parser: {e}")
+        return []
 
-    # Very naive import scraper
-    imports = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for n in node.names:
-                imports.append(n.name)
-        elif isinstance(node, ast.ImportFrom):
-            if node.module:
-                imports.append(node.module)
+    source_bytes = file_content.encode('utf-8')
+    tree = parser.parse(source_bytes)
+    
+    global_imports = extract_imports(tree, source_bytes)
+    chunks = []
+    
+    def process_node(node, parent_name=None):
+        if node.type in ['function_definition', 'class_definition']:
+            name_node = node.child_by_field_name('name')
+            name = node_text(name_node, source_bytes) if name_node else "anonymous"
+            
+            if parent_name:
+                full_name = f"{parent_name}.{name}"
+                entity_type = "method" if node.type == 'function_definition' else "class"
+            else:
+                full_name = name
+                entity_type = "function" if node.type == 'function_definition' else "class"
+            
+            code = node_text(node, source_bytes)
+            docstring = extract_docstring(node, source_bytes)
+            calls = extract_calls(node, source_bytes)
+            
+            tokens = count_tokens(code)
+            
+            chunks.append({
+                "repo": repo,
+                "file": file_path,
+                "entity_type": entity_type,
+                "name": full_name,
+                "code": code,
+                "docstring": docstring,
+                "imports": global_imports,
+                "calls": calls,
+                "called_by": [], # to be populated by graph linkage layer
+                "external_calls": [], # to be populated by graph linkage layer
+                "tokens": tokens,
+                "start_line": node.start_point[0] + 1,
+                "end_line": node.end_point[0] + 1
+            })
+            
+            body = node.child_by_field_name('body')
+            if body:
+                for child in body.children:
+                    process_node(child, full_name)
+        else:
+            for child in node.children:
+                process_node(child, parent_name)
                 
-    lines = file_content.splitlines()
-
-    for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            start_line = node.lineno
-            end_line = getattr(node, 'end_lineno', start_line + 10)
-            
-            block_code = "\n".join(lines[start_line - 1:end_line])
-            node_type = "class" if isinstance(node, ast.ClassDef) else "function"
-            
-            node_chunks = process_node(block_code, file_path, node.name, node_type, imports, start_line, end_line)
-            chunks.extend(node_chunks)
-            
-    # If no functions/classes were caught, chunk the entire module
+    process_node(tree.root_node)
+    
     if not chunks and file_content.strip():
-        module_chunks = process_node(file_content, file_path, "module", "module", imports, 1, len(lines))
-        chunks.extend(module_chunks)
+        chunks.append({
+            "repo": repo,
+            "file": file_path,
+            "entity_type": "module",
+            "name": "module",
+            "code": file_content,
+            "docstring": "",
+            "imports": global_imports,
+            "calls": extract_calls(tree.root_node, source_bytes) if tree.root_node else [],
+            "called_by": [],
+            "external_calls": [],
+            "tokens": count_tokens(file_content),
+            "start_line": 1,
+            "end_line": len(file_content.splitlines())
+        })
         
     return chunks

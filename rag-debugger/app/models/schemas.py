@@ -8,6 +8,7 @@ class DebugRequest(BaseModel):
     line: Optional[int] = None
     repo_path: Optional[str] = None
     extras: Optional[Dict[str, Any]] = None
+    debug_mode: bool = False
 
 class DebugResponse(BaseModel):
     status: str  # "success", "failed", "not_applied"
@@ -19,3 +20,4 @@ class DebugResponse(BaseModel):
     explanation: Optional[str] = None
     confidence: Optional[int] = None
     risk: Optional[str] = None
+    debug_info: Optional[Dict[str, Any]] = None

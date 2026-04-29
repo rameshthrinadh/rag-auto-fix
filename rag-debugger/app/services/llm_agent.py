@@ -15,34 +15,32 @@ def generate_fix(context: str, model: str) -> Dict[str, Any]:
     Returns a dictionary with metadata and the fix payload.
     """
     system_prompt = (
-        "You are an expert Python debugging agent. "
-        "You must analyze the following error and provide a structured plan for repair.\n\n"
-        "CORE RULE: 'IF YOU ARE NOT 100% SURE, DO NOT PROVIDE A FIX'.\n"
-        "You are strictly prohibited from guessing or assuming column names, variable names, or business logic. "
-        "All fixes must be based on direct evidence from the provided code context and stacktrace.\n\n"
+        "You are an expert Python code intelligence system and debugging agent.\n"
+        "You must analyze the error and the provided XML-like context entities, then trace the execution step-by-step.\n\n"
+        "CORE RULES:\n"
+        "1. ZERO HALLUCINATION. If the provided context is insufficient to determine the root cause, you MUST state 'UNKNOWN' and refuse to provide a fix.\n"
+        "2. EXPLICIT DEPENDENCY REASONING. You must trace the variable flow across the provided functions/files.\n"
+        "3. NEVER assume missing logic, variables, or column names. Only use what is present in the context.\n\n"
         "Your response MUST strictly follow this exact format with these markers:\n"
+        "[TRACE]\n"
+        "Trace the execution step-by-step from the error origin through the provided functions. Identify exact points where state goes bad.\n"
         "[ROOT CAUSE]\n"
-        "Briefly describe the bug origin.\n"
+        "Briefly describe the exact origin of the bug, or 'UNKNOWN' if context is insufficient.\n"
         "[EXPLANATION]\n"
-        "Explain the fix logic and why it is safe. Include any doubts here.\n"
+        "Explain the fix logic and why it is safe. Highlight any assumptions made.\n"
         "[CONFIDENCE]\n"
-        "Integer 0-100. CRITICAL: If you are making ANY assumption or guess, your confidence MUST be below 50.\n"
+        "Integer 0-100. CRITICAL: If you are making ANY assumption, your confidence MUST be below 50.\n"
         "[RISK]\n"
         "LOW, MEDIUM, or HIGH.\n"
         "[FIX]\n"
-        "The Search/Replace blocks. If you are not confident, leave this section EMPTY.\n"
+        "The Search/Replace blocks. If you are not confident or root cause is UNKNOWN, leave this section EMPTY.\n"
         "CRITICAL: You MUST replace `exact/path/to/file.py` with the EXACT relative file path provided in the chunks ABOVE.\n"
         "<<<< exact/path/to/file.py\n"
         "original lines\n"
         "====\n"
         "replacement lines\n"
         ">>>>\n\n"
-        "CRITICAL:\n"
-        "1. NO GUESSING. If you have to assume a column name like 'quantity', you have FAILED the core rule.\n"
-        "2. Your SEARCH block must be UNIQUE.\n"
-        "3. DO NOT change function signatures.\n"
-        "4. Fix only the core issue. Avoid broad refactorings.\n"
-        "5. Do not wrap your response in markdown code blocks."
+        "Do not wrap your response in markdown code blocks outside of the FIX block."
     )
     
     tokens_in = len(tokenizer.encode(system_prompt + "\n" + context))
@@ -87,6 +85,7 @@ def parse_llm_response(raw_text: str) -> Dict[str, Any]:
     Parses the structured text response from the LLM.
     """
     result = {
+        "trace": "No trace provided.",
         "root_cause": "Unknown",
         "explanation": "No explanation provided.",
         "confidence": 0,
@@ -94,7 +93,9 @@ def parse_llm_response(raw_text: str) -> Dict[str, Any]:
         "fix": ""
     }
     
-    # Simple regex-based extraction for the sections
+    trace_match = re.search(r"\[TRACE\]\n(.*?)(?=\[|$)", raw_text, re.DOTALL)
+    if trace_match: result["trace"] = trace_match.group(1).strip()
+    
     rc_match = re.search(r"\[ROOT CAUSE\]\n(.*?)(?=\[|$)", raw_text, re.DOTALL)
     if rc_match: result["root_cause"] = rc_match.group(1).strip()
     

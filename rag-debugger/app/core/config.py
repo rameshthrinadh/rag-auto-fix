@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     EMBEDDING_MODEL: str = "text-embedding-ada-002"
     MAX_RETRIES: int = 2
     REPO_PATH: str = "/tmp/default_repo"
+    REPO_MAP_PATH: str = "./data/faiss_index/repo_map.md"
 
     class Config:
         env_file = ".env"

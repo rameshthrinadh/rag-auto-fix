@@ -14,6 +14,8 @@ from indexing.chunker import get_ast_chunks
 from indexing.hash_utils import generate_content_hash
 from indexing.embedding_store import load_persistence, save_persistence, clear_persistence
 from indexing.faiss_store import load_faiss_index, save_faiss_index, clear_faiss_index
+from indexing.graph_store import load_graph, save_graph, clear_graph, build_graph_from_chunks
+from indexing.mapper import generate_repo_map
 from app.core.config import settings
 from app.core.constants import MIN_CHUNK_TOKENS
 
@@ -39,8 +41,10 @@ def build_index(repo_path: str, force_rebuild: bool = False):
         print("Force rebuild requested. Clearing cache...")
         clear_persistence()
         clear_faiss_index()
+        clear_graph()
 
     print(f"Scanning {repo_path}...")
+    generate_repo_map(repo_path, settings.REPO_MAP_PATH)
     files = load_repo_files(repo_path)
     
     all_chunks = []
@@ -57,6 +61,7 @@ def build_index(repo_path: str, force_rebuild: bool = False):
     # Load persistent stores
     metadata_list, embeddings_np = load_persistence()
     index = load_faiss_index()
+    graph = load_graph()
 
     # Build lookup of existing hashes
     existing_hashes = {m['content_hash'] for m in metadata_list}
@@ -105,9 +110,13 @@ def build_index(repo_path: str, force_rebuild: bool = False):
         # Append to metadata list
         metadata_list.extend(new_chunks)
 
+        # Update Graph DB
+        graph = build_graph_from_chunks(new_chunks, graph)
+
         # Save updates safely down to disk
         save_persistence(metadata_list, embeddings_np)
         save_faiss_index(index)
+        save_graph(graph)
         
         print(f"Index and cache successfully updated.")
     else:
